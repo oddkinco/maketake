@@ -44,6 +44,7 @@ let zoom = 1;
 let panX = 0;
 let panY = 0;
 let isPanning = false;
+let didPan = false;
 let panStart = { x: 0, y: 0 };
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 10;
@@ -1667,6 +1668,12 @@ function handleMouseMove(e) {
 
 function handleRightClick(e) {
     e.preventDefault();
+    
+    // If we just finished panning with right-click, skip other actions
+    if (didPan) {
+        didPan = false;
+        return;
+    }
     
     // Cancel any ongoing drag operations
     if (isDraggingFromPoint) {
@@ -3584,10 +3591,11 @@ function handleWheel(e) {
 }
 
 function handlePanStart(e) {
-    // Middle mouse button (button 1) or space key held
-    if (e.button === 1) {
+    // Middle mouse button (button 1) or right mouse button (button 2)
+    if (e.button === 1 || e.button === 2) {
         e.preventDefault();
         isPanning = true;
+        didPan = false;
         panStart = { x: e.clientX - panX, y: e.clientY - panY };
         whiteboard.style.cursor = 'grabbing';
     }
@@ -3596,6 +3604,7 @@ function handlePanStart(e) {
 function handlePanMove(e) {
     if (!isPanning) return;
     
+    didPan = true;
     panX = e.clientX - panStart.x;
     panY = e.clientY - panStart.y;
     updateTransform();
