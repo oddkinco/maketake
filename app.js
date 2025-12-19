@@ -2,12 +2,42 @@
 let points = [];
 let lines = [];
 let fills = []; // Array of { pointIds: [...], color: '...' }
-let currentMode = 'add'; // 'add', 'move', 'connect', 'delete', 'fill', 'select'
+let currentMode = 'add'; // 'add', 'move', 'connect', 'delete', 'fill', 'select', 'selectFace'
 let currentColor = '#3b82f6';
 let linesVisible = true;
 let selectedGroup = new Set(); // Set of point IDs in the current selection group
 let isGroupDragging = false;
 let groupDragStart = { x: 0, y: 0 };
+
+// Rectangle selection state
+let isRectSelecting = false;
+let rectSelectStart = { x: 0, y: 0 };
+let rectSelectElement = null;
+let rectSelectMode = 'replace'; // 'replace', 'add', 'remove'
+
+// Line splitting state
+let isDraggingFromLine = false;
+let splitLineData = null;
+let lineSplitPreview = null; // { dot, line1, line2 } SVG elements for preview
+
+// Dragging from point to create new line
+let isDraggingFromPoint = false;
+let dragFromPointData = null;
+
+// Dragging from empty space to create new line with new points
+let isDraggingFromEmpty = false;
+let emptyDragData = null;
+
+// Background image state
+let bgImageData = null; // { src, naturalWidth, naturalHeight, scale, x, y }
+
+// Clipboard for copy/paste
+let clipboard = null; // { points: [], lines: [] }
+
+// Color swatches (index 0 is always transparent)
+let swatches = [null]; // null = transparent, string = color
+const MAX_SWATCHES = 12;
+let selectedSwatchIndex = -1; // -1 means using color picker, 0 = transparent
 
 // Zoom and pan state
 let zoom = 1;
@@ -50,7 +80,8 @@ const showLinesCheckbox = document.getElementById('showLines');
 
 // Group operation buttons
 const groupOpsContainer = document.getElementById('groupOps');
-const moveGroupBtn = document.getElementById('moveGroup');
+const moveGroupToggle = document.getElementById('moveGroupToggle');
+let isMoveGroupActive = false; // Toggle state for move group mode
 const duplicateGroupBtn = document.getElementById('duplicateGroup');
 const flipHGroupBtn = document.getElementById('flipHGroup');
 const flipVGroupBtn = document.getElementById('flipVGroup');
@@ -64,6 +95,21 @@ const zoomInBtn = document.getElementById('zoomIn');
 const zoomOutBtn = document.getElementById('zoomOut');
 const zoomResetBtn = document.getElementById('zoomReset');
 const zoomLevelDisplay = document.getElementById('zoomLevel');
+const selectionRectElement = document.getElementById('selectionRect');
+
+// Background image elements
+const backgroundImage = document.getElementById('backgroundImage');
+const loadBackgroundBtn = document.getElementById('loadBackground');
+const clearBackgroundBtn = document.getElementById('clearBackground');
+const bgImageInput = document.getElementById('bgImageInput');
+const bgScaleSlider = document.getElementById('bgScale');
+const bgScaleDisplay = document.getElementById('bgScaleDisplay');
+
+// Select face mode
+const selectFaceModeBtn = document.getElementById('selectFaceMode');
+
+// Swatch grid
+const swatchGrid = document.getElementById('swatchGrid');
 const undoBtn = document.getElementById('undoBtn');
 const redoBtn = document.getElementById('redoBtn');
 const clearAllBtn = document.getElementById('clearAll');
@@ -71,13 +117,32 @@ const downloadSvgBtn = document.getElementById('downloadSvg');
 const importSvgBtn = document.getElementById('importSvg');
 const svgFileInput = document.getElementById('svgFileInput');
 const showPointsCheckbox = document.getElementById('showPoints');
+const themeToggle = document.getElementById('themeToggle');
 
 // Initialize
 function init() {
+    loadTheme();
     loadState();
     setupEventListeners();
     updateStatus();
     updateUndoButton();
+}
+
+// Theme handling
+function loadTheme() {
+    const savedTheme = localStorage.getItem('theme');
+    if (savedTheme) {
+        document.documentElement.setAttribute('data-theme', savedTheme);
+    } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+    }
+}
+
+function toggleTheme() {
+    const currentTheme = document.documentElement.getAttribute('data-theme');
+    const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', newTheme);
+    localStorage.setItem('theme', newTheme);
 }
 
 // Event Listeners
@@ -93,7 +158,7 @@ function setupEventListeners() {
     showLinesCheckbox.addEventListener('change', toggleLinesVisibility);
     
     // Group operation listeners
-    moveGroupBtn.addEventListener('mousedown', startGroupDrag);
+    moveGroupToggle.addEventListener('click', toggleMoveGroupMode);
     duplicateGroupBtn.addEventListener('click', duplicateGroup);
     flipHGroupBtn.addEventListener('click', () => flipGroup('horizontal'));
     flipVGroupBtn.addEventListener('click', () => flipGroup('vertical'));
@@ -111,6 +176,25 @@ function setupEventListeners() {
     whiteboard.addEventListener('mousedown', handlePanStart);
     document.addEventListener('mousemove', handlePanMove);
     document.addEventListener('mouseup', handlePanEnd);
+    
+    // Background image controls
+    loadBackgroundBtn.addEventListener('click', () => bgImageInput.click());
+    bgImageInput.addEventListener('change', handleBackgroundLoad);
+    clearBackgroundBtn.addEventListener('click', clearBackground);
+    bgScaleSlider.addEventListener('input', handleBackgroundScale);
+    
+    // Select face mode
+    selectFaceModeBtn.addEventListener('click', () => setMode('selectFace'));
+    
+    // Initialize swatches
+    initSwatches();
+    
+    // Color picker - deselect swatch when using picker
+    colorPicker.addEventListener('input', () => {
+        selectedSwatchIndex = -1;
+        updateSwatchSelection();
+        handleColorChange({ target: colorPicker });
+    });
     undoBtn.addEventListener('click', undo);
     redoBtn.addEventListener('click', redo);
     clearAllBtn.addEventListener('click', clearAll);
@@ -118,6 +202,9 @@ function setupEventListeners() {
     importSvgBtn.addEventListener('click', () => svgFileInput.click());
     svgFileInput.addEventListener('change', handleSvgImport);
     showPointsCheckbox.addEventListener('change', togglePointsVisibility);
+    
+    // Theme toggle
+    themeToggle.addEventListener('click', toggleTheme);
 
     // Whiteboard events
     whiteboard.addEventListener('click', handleWhiteboardClick);
@@ -394,6 +481,74 @@ function undo() {
             fillsLayer.innerHTML = '';
             fills.forEach(f => renderFill(f));
             break;
+            
+        case 'splitLine':
+            // Remove any auto-created fill
+            if (action.newFill) {
+                const fillIdx = fills.findIndex(f => facesEqual(f.pointIds, action.newFill.pointIds));
+                if (fillIdx >= 0) {
+                    removeFillByPointIds(fills[fillIdx].pointIds);
+                    fills.splice(fillIdx, 1);
+                }
+            }
+            
+            // Remove the new lines
+            action.newLines.forEach(l => {
+                const lineIdx = lines.findIndex(line => 
+                    (line.from === l.from && line.to === l.to) ||
+                    (line.from === l.to && line.to === l.from)
+                );
+                if (lineIdx >= 0) {
+                    const lineEl = linesLayer.querySelector(
+                        `[data-from="${lines[lineIdx].from}"][data-to="${lines[lineIdx].to}"]`
+                    );
+                    if (lineEl) lineEl.remove();
+                    lines.splice(lineIdx, 1);
+                }
+            });
+            
+            // Remove the new point if we created one
+            if (action.newPoint) {
+                removePointWithoutUndo(action.newPoint.id);
+            }
+            
+            // For old behavior (replacing line), restore the old line
+            if (!action.keepOriginal && action.oldLine) {
+                lines.push({ ...action.oldLine });
+                renderLine(action.oldLine);
+            }
+            break;
+            
+        case 'dragCreateLine':
+            // Remove the new point (this also removes the new line)
+            removePointWithoutUndo(action.newPoint.id);
+            break;
+            
+        case 'emptyDragLine':
+            // Remove the start point (removes the line too)
+            removePointWithoutUndo(action.startPoint.id);
+            // Remove the end point if we created it
+            if (action.endPoint) {
+                removePointWithoutUndo(action.endPoint.id);
+            }
+            break;
+            
+        case 'paste':
+            // Remove pasted fills first
+            if (action.newFills) {
+                action.newFills.forEach(f => {
+                    const idx = fills.findIndex(fill => facesEqual(fill.pointIds, f.pointIds));
+                    if (idx >= 0) {
+                        removeFillByPointIds(fills[idx].pointIds);
+                        fills.splice(idx, 1);
+                    }
+                });
+            }
+            // Remove pasted points (this also removes lines)
+            action.newPoints.forEach(p => {
+                removePointWithoutUndo(p.id);
+            });
+            break;
     }
     
     saveState();
@@ -592,6 +747,82 @@ function redo() {
             fillsLayer.innerHTML = '';
             fills.forEach(f => renderFill(f));
             break;
+            
+        case 'splitLine':
+            // For old behavior (replacing line), remove the old line
+            if (!action.keepOriginal && action.oldLine) {
+                const oldLineIdx = lines.findIndex(l => 
+                    (l.from === action.oldLine.from && l.to === action.oldLine.to) ||
+                    (l.from === action.oldLine.to && l.to === action.oldLine.from)
+                );
+                if (oldLineIdx >= 0) {
+                    const lineEl = linesLayer.querySelector(
+                        `[data-from="${lines[oldLineIdx].from}"][data-to="${lines[oldLineIdx].to}"]`
+                    );
+                    if (lineEl) lineEl.remove();
+                    lines.splice(oldLineIdx, 1);
+                }
+            }
+            
+            // Re-add the new point if we created one
+            if (action.newPoint) {
+                points.push({ ...action.newPoint });
+                renderPoint(action.newPoint);
+            }
+            
+            // Re-add the new lines
+            action.newLines.forEach(l => {
+                lines.push({ ...l });
+                renderLine(l);
+            });
+            
+            // Re-add the auto-fill
+            if (action.newFill) {
+                fills.push({ ...action.newFill, pointIds: [...action.newFill.pointIds] });
+                renderFill(action.newFill);
+            }
+            break;
+            
+        case 'dragCreateLine':
+            // Re-add the new point and line
+            points.push({ ...action.newPoint });
+            renderPoint(action.newPoint);
+            lines.push({ ...action.newLine });
+            renderLine(action.newLine);
+            break;
+            
+        case 'emptyDragLine':
+            // Re-add the start point
+            points.push({ ...action.startPoint });
+            renderPoint(action.startPoint);
+            // Re-add the end point if we created it
+            if (action.endPoint) {
+                points.push({ ...action.endPoint });
+                renderPoint(action.endPoint);
+            }
+            // Re-add the line
+            lines.push({ ...action.newLine });
+            renderLine(action.newLine);
+            break;
+            
+        case 'paste':
+            // Re-add pasted points and lines
+            action.newPoints.forEach(p => {
+                points.push({ ...p });
+                renderPoint(p);
+            });
+            action.newLines.forEach(l => {
+                lines.push({ ...l });
+                renderLine(l);
+            });
+            // Re-add pasted fills
+            if (action.newFills) {
+                action.newFills.forEach(f => {
+                    fills.push({ ...f, pointIds: [...f.pointIds] });
+                    renderFill(f);
+                });
+            }
+            break;
     }
     
     saveState();
@@ -615,24 +846,37 @@ function setMode(mode) {
     deleteModeBtn.classList.toggle('active', mode === 'delete');
     fillModeBtn.classList.toggle('active', mode === 'fill');
     selectModeBtn.classList.toggle('active', mode === 'select');
+    selectFaceModeBtn.classList.toggle('active', mode === 'selectFace');
 
     // Update cursor
-    whiteboard.classList.remove('move-mode', 'connect-mode', 'delete-mode', 'fill-mode', 'select-mode');
+    whiteboard.classList.remove('move-mode', 'connect-mode', 'delete-mode', 'fill-mode', 'select-mode', 'select-face-mode');
     if (mode === 'move') whiteboard.classList.add('move-mode');
     if (mode === 'connect') whiteboard.classList.add('connect-mode');
     if (mode === 'delete') whiteboard.classList.add('delete-mode');
     if (mode === 'fill') whiteboard.classList.add('fill-mode');
     if (mode === 'select') whiteboard.classList.add('select-mode');
+    if (mode === 'selectFace') whiteboard.classList.add('select-face-mode');
     
-    // Clear selection when leaving select mode
-    if (mode !== 'select' && selectedGroup.size > 0) {
-        clearSelection();
+    // Clear selection and move group toggle when leaving all select modes
+    const isSelectMode = mode === 'select' || mode === 'selectFace';
+    if (!isSelectMode) {
+        if (selectedGroup.size > 0) {
+            clearSelection();
+        }
+        // Deactivate move group toggle
+        if (isMoveGroupActive) {
+            isMoveGroupActive = false;
+            moveGroupToggle.classList.remove('active');
+        }
     }
 
     // Clear selection when changing modes
     if (selectedPoint) {
         deselectPoint();
     }
+    
+    // Clean up line split preview
+    hideLineSplitPreview();
 
     updateStatus();
 }
@@ -703,13 +947,22 @@ function deselectPoint() {
 }
 
 // Line Management
-function createLine(point1Id, point2Id) {
+function createLine(point1Id, point2Id, skipIntersectionCheck = false) {
     // Check if line already exists
     const exists = lines.some(
         line => (line.from === point1Id && line.to === point2Id) ||
                 (line.from === point2Id && line.to === point1Id)
     );
-    if (exists) return null;
+    if (exists) {
+        showTempStatus('Line already exists');
+        return null;
+    }
+    
+    // Check if line would intersect existing lines
+    if (!skipIntersectionCheck && wouldLineIntersect(point1Id, point2Id)) {
+        showTempStatus('Cannot create: line would cross existing line');
+        return null; // Prevent overlapping lines
+    }
 
     const line = { from: point1Id, to: point2Id };
     lines.push(line);
@@ -718,6 +971,16 @@ function createLine(point1Id, point2Id) {
     pushUndo({ type: 'addLine', line: { ...line } });
     saveState();
     return line;
+}
+
+function showTempStatus(message, duration = 2000) {
+    const originalText = statusText.textContent;
+    statusText.textContent = message;
+    statusText.style.color = 'var(--danger)';
+    setTimeout(() => {
+        statusText.style.color = '';
+        updateStatus();
+    }, duration);
 }
 
 function renderLine(line) {
@@ -806,6 +1069,18 @@ function createTempLine(fromPoint, toX, toY) {
     }
     tempLine.setAttribute('x1', fromPoint.x);
     tempLine.setAttribute('y1', fromPoint.y);
+    tempLine.setAttribute('x2', toX);
+    tempLine.setAttribute('y2', toY);
+}
+
+function createTempLineFromCoords(fromX, fromY, toX, toY) {
+    if (!tempLine) {
+        tempLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        tempLine.classList.add('temp-line');
+        linesLayer.appendChild(tempLine);
+    }
+    tempLine.setAttribute('x1', fromX);
+    tempLine.setAttribute('y1', fromY);
     tempLine.setAttribute('x2', toX);
     tempLine.setAttribute('y2', toY);
 }
@@ -931,6 +1206,54 @@ function findAllFaces() {
         .map(f => f.face);
 }
 
+// Check if two line segments intersect (not at endpoints)
+function lineSegmentsIntersect(p1, p2, p3, p4) {
+    // Returns true if line segment p1-p2 intersects with p3-p4
+    // Excludes cases where they share an endpoint
+    
+    // Check if segments share an endpoint
+    const shareEndpoint = (
+        (p1.id === p3.id || p1.id === p4.id || p2.id === p3.id || p2.id === p4.id)
+    );
+    if (shareEndpoint) return false;
+    
+    // Use parametric line intersection with tolerance
+    const x1 = p1.x, y1 = p1.y;
+    const x2 = p2.x, y2 = p2.y;
+    const x3 = p3.x, y3 = p3.y;
+    const x4 = p4.x, y4 = p4.y;
+    
+    const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    
+    // Lines are parallel (or nearly so)
+    if (Math.abs(denom) < 0.0001) return false;
+    
+    const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+    const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
+    
+    // Check if intersection point is within both segments (with small tolerance at endpoints)
+    const eps = 0.001;
+    return t > eps && t < (1 - eps) && u > eps && u < (1 - eps);
+}
+
+// Check if a new line would intersect any existing lines
+function wouldLineIntersect(fromId, toId) {
+    const p1 = points.find(p => p.id === fromId);
+    const p2 = points.find(p => p.id === toId);
+    if (!p1 || !p2) return false;
+    
+    for (const line of lines) {
+        const p3 = points.find(p => p.id === line.from);
+        const p4 = points.find(p => p.id === line.to);
+        if (!p3 || !p4) continue;
+        
+        if (lineSegmentsIntersect(p1, p2, p3, p4)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Check if a point is inside a polygon
 function pointInPolygon(x, y, polygonPointIds) {
     const polygon = polygonPointIds.map(id => points.find(p => p.id === id)).filter(p => p);
@@ -996,23 +1319,40 @@ function fillRegion(x, y) {
     const face = findFaceAtPoint(x, y);
     if (!face) return; // Clicked in unbounded area
     
+    const activeColor = getActiveColor();
+    
     // Check if this face already has a fill
     const existingIndex = fills.findIndex(f => facesEqual(f.pointIds, face));
+    
+    if (activeColor === null) {
+        // Transparent selected - remove fill if exists
+        if (existingIndex >= 0) {
+            const removedFill = fills[existingIndex];
+            pushUndo({ 
+                type: 'removeFill', 
+                fill: { ...removedFill, pointIds: [...removedFill.pointIds] }
+            });
+            removeFillByPointIds(removedFill.pointIds);
+            fills.splice(existingIndex, 1);
+            saveState();
+        }
+        return;
+    }
     
     if (existingIndex >= 0) {
         // Update existing fill
         const oldColor = fills[existingIndex].color;
-        fills[existingIndex].color = currentColor;
+        fills[existingIndex].color = activeColor;
         updateFillElement(fills[existingIndex]);
         pushUndo({ 
             type: 'updateFill', 
             pointIds: [...face], 
             oldColor, 
-            newColor: currentColor 
+            newColor: activeColor 
         });
     } else {
         // Create new fill
-        const fill = { pointIds: [...face], color: currentColor };
+        const fill = { pointIds: [...face], color: activeColor };
         fills.push(fill);
         renderFill(fill);
         pushUndo({ type: 'addFill', fill: { ...fill, pointIds: [...fill.pointIds] } });
@@ -1111,6 +1451,20 @@ function handleWhiteboardClick(e) {
         return;
     }
     
+    // Handle selectFace mode - select points of the face at click location
+    if (currentMode === 'selectFace') {
+        let mode = 'replace';
+        if (e.altKey && e.shiftKey) {
+            mode = 'remove';
+        } else if (e.altKey) {
+            mode = 'add';
+        } else if (e.ctrlKey || e.metaKey) {
+            mode = 'add'; // Ctrl also adds
+        }
+        selectFaceAtPoint(coords.x, coords.y, mode);
+        return;
+    }
+    
     // Handle line click in delete mode
     if (currentMode === 'delete' && lineElement) {
         const fromId = parseInt(lineElement.dataset.from);
@@ -1137,6 +1491,62 @@ function handleWhiteboardClick(e) {
 
 function handleMouseDown(e) {
     const pointElement = e.target.closest('.point');
+    const lineElement = e.target.closest('.connection-line');
+    
+    // Handle select mode with rectangle selection
+    if (currentMode === 'select') {
+        if (pointElement) {
+            // Ctrl+click toggles individual point
+            if (e.ctrlKey || e.metaKey) {
+                e.preventDefault();
+                const pointId = parseInt(pointElement.dataset.id);
+                togglePointInGroup(pointId);
+                return;
+            }
+            // If move group mode is active and clicking a selected point, let it fall through to group drag
+            if (isMoveGroupActive && selectedGroup.has(parseInt(pointElement.dataset.id))) {
+                // Will be handled below in the move group section
+            } else {
+                // Not in move group mode - regular selection behavior
+                // Fall through to handle point click
+            }
+        } else {
+            // Start rectangle selection if not clicking a point (and not in move group mode, or no selection)
+            if (!isMoveGroupActive || selectedGroup.size === 0) {
+                e.preventDefault();
+                startRectSelection(e);
+                return;
+            }
+        }
+    }
+    
+    // Handle line splitting in connect mode
+    if (currentMode === 'connect' && !pointElement && lineElement) {
+        e.preventDefault();
+        const fromId = parseInt(lineElement.dataset.from);
+        const toId = parseInt(lineElement.dataset.to);
+        const line = lines.find(l => 
+            (l.from === fromId && l.to === toId) ||
+            (l.from === toId && l.to === fromId)
+        );
+        if (line) {
+            startLineSplit(e, line);
+        }
+        return;
+    }
+    
+    // Handle dragging from empty space in connect mode
+    if (currentMode === 'connect' && !pointElement && !lineElement) {
+        e.preventDefault();
+        const coords = getMouseCoords(e);
+        isDraggingFromEmpty = true;
+        emptyDragData = {
+            startX: coords.x,
+            startY: coords.y
+        };
+        return;
+    }
+    
     if (!pointElement) return;
 
     const pointId = parseInt(pointElement.dataset.id);
@@ -1145,33 +1555,60 @@ function handleMouseDown(e) {
 
     if (currentMode === 'move') {
         e.preventDefault();
+        const coords = getMouseCoords(e);
+        
+        // Move single point in move mode
         draggedPoint = point;
         draggedPoint.startX = point.x;
         draggedPoint.startY = point.y;
-        const coords = getMouseCoords(e);
         dragOffset = {
             x: coords.x - point.x,
             y: coords.y - point.y
         };
         pointElement.classList.add('dragging');
+    } else if ((currentMode === 'select' || currentMode === 'selectFace') && isMoveGroupActive) {
+        // Move group mode is active - drag the selection
+        if (selectedGroup.has(point.id) && selectedGroup.size > 0) {
+            e.preventDefault();
+            const coords = getMouseCoords(e);
+            isGroupDragging = true;
+            groupDragStart = { x: coords.x, y: coords.y };
+            // Store starting positions for all points in group
+            selectedGroup.forEach(id => {
+                const p = points.find(pt => pt.id === id);
+                if (p) {
+                    p.startX = p.x;
+                    p.startY = p.y;
+                }
+            });
+        }
     } else if (currentMode === 'connect') {
         e.preventDefault();
+        // Start dragging from this point to create a new line
+        isDraggingFromPoint = true;
+        dragFromPointData = { 
+            fromPoint: point,
+            startX: point.x,
+            startY: point.y
+        };
+        
+        // If there's already a selected point, we might be clicking to connect
         if (selectedPoint && selectedPoint.id !== point.id) {
-            // Create line between selected and clicked point
-            createLine(selectedPoint.id, point.id);
-            // Select the new point to allow chaining connections
-            deselectPoint();
-            selectPoint(point);
-        } else if (!selectedPoint) {
-            selectPoint(point);
+            // Try to create line immediately (click-to-connect behavior)
+            dragFromPointData.previousSelected = selectedPoint;
         }
-        // If clicking the same point, do nothing (keep it selected)
+        
+        selectPoint(point);
     } else if (currentMode === 'delete') {
         e.preventDefault();
         deletePoint(point);
     } else if (currentMode === 'select') {
         e.preventDefault();
-        togglePointInGroup(point.id);
+        // Non-ctrl click on point in select mode - start fresh selection with this point
+        if (!e.ctrlKey && !e.metaKey) {
+            clearSelection();
+            togglePointInGroup(point.id);
+        }
     }
 }
 
@@ -1182,13 +1619,70 @@ function handleMouseMove(e) {
         draggedPoint.x = coords.x - dragOffset.x;
         draggedPoint.y = coords.y - dragOffset.y;
         updatePointPosition(draggedPoint);
-    } else if (currentMode === 'connect' && selectedPoint) {
-        createTempLine(selectedPoint, coords.x, coords.y);
+    } else if (isGroupDragging && selectedGroup.size > 0) {
+        // Move entire group (in select mode with move toggle active)
+        const dx = coords.x - groupDragStart.x;
+        const dy = coords.y - groupDragStart.y;
+        selectedGroup.forEach(id => {
+            const p = points.find(pt => pt.id === id);
+            if (p && p.startX !== undefined) {
+                p.x = p.startX + dx;
+                p.y = p.startY + dy;
+                updatePointPosition(p);
+            }
+        });
+    } else if (currentMode === 'connect') {
+        if (isDraggingFromLine && splitLineData) {
+            // Update preview while dragging from line
+            updateLineSplitPreviewDrag(coords.x, coords.y);
+        } else if (isDraggingFromPoint && selectedPoint) {
+            // Show temp line while dragging from point
+            hideLineSplitPreview(); // Hide split preview when dragging from point
+            createTempLine(selectedPoint, coords.x, coords.y);
+        } else if (isDraggingFromEmpty && emptyDragData) {
+            // Show temp line from empty space origin
+            hideLineSplitPreview();
+            createTempLineFromCoords(emptyDragData.startX, emptyDragData.startY, coords.x, coords.y);
+        } else if (!isDraggingFromPoint && !isDraggingFromLine && !isDraggingFromEmpty) {
+            // Check if hovering over a line to show split preview
+            const lineElement = document.elementFromPoint(e.clientX, e.clientY)?.closest('.connection-line');
+            if (lineElement) {
+                const fromId = parseInt(lineElement.dataset.from);
+                const toId = parseInt(lineElement.dataset.to);
+                const line = lines.find(l => 
+                    (l.from === fromId && l.to === toId) ||
+                    (l.from === toId && l.to === fromId)
+                );
+                if (line) {
+                    showLineSplitPreview(coords.x, coords.y, line);
+                }
+            } else {
+                hideLineSplitPreview();
+            }
+        }
+    } else if (currentMode === 'select' && isRectSelecting) {
+        updateRectSelection(e);
     }
 }
 
 function handleRightClick(e) {
     e.preventDefault();
+    
+    // Cancel any ongoing drag operations
+    if (isDraggingFromPoint) {
+        isDraggingFromPoint = false;
+        dragFromPointData = null;
+        removeTempLine();
+        deselectPoint();
+        return;
+    }
+    
+    if (isDraggingFromEmpty) {
+        isDraggingFromEmpty = false;
+        emptyDragData = null;
+        removeTempLine();
+        return;
+    }
     
     if (currentMode === 'fill') {
         // Remove fill at click location
@@ -1199,7 +1693,45 @@ function handleRightClick(e) {
     }
 }
 
-function handleMouseUp() {
+function handleMouseUp(e) {
+    // Handle group drag end in move mode
+    if (isGroupDragging && selectedGroup.size > 0) {
+        const coords = getMouseCoords(e);
+        const dx = coords.x - groupDragStart.x;
+        const dy = coords.y - groupDragStart.y;
+        
+        // Only save undo if actually moved
+        if (Math.abs(dx) > 0.1 || Math.abs(dy) > 0.1) {
+            // Collect old positions for undo
+            const oldPositions = [];
+            selectedGroup.forEach(id => {
+                const p = points.find(pt => pt.id === id);
+                if (p && p.startX !== undefined) {
+                    oldPositions.push({ id: p.id, x: p.startX, y: p.startY });
+                }
+            });
+            
+            pushUndo({
+                type: 'moveGroup',
+                positions: oldPositions,
+                dx: dx,
+                dy: dy
+            });
+            saveState();
+        }
+        
+        // Clean up start positions
+        selectedGroup.forEach(id => {
+            const p = points.find(pt => pt.id === id);
+            if (p) {
+                delete p.startX;
+                delete p.startY;
+            }
+        });
+        
+        isGroupDragging = false;
+    }
+    
     if (draggedPoint) {
         const element = getPointElement(draggedPoint.id);
         if (element) {
@@ -1221,6 +1753,26 @@ function handleMouseUp() {
         delete draggedPoint.startY;
         draggedPoint = null;
     }
+    
+    // Handle rectangle selection end
+    if (isRectSelecting) {
+        endRectSelection(e);
+    }
+    
+    // Handle line split end
+    if (isDraggingFromLine) {
+        endLineSplit(e);
+    }
+    
+    // Handle drag from point to create line
+    if (isDraggingFromPoint) {
+        endPointDrag(e);
+    }
+    
+    // Handle drag from empty space to create line
+    if (isDraggingFromEmpty) {
+        endEmptyDrag(e);
+    }
 }
 
 function handleKeyDown(e) {
@@ -1241,6 +1793,22 @@ function handleKeyDown(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
         e.preventDefault();
         redo();
+        return;
+    }
+    // Cut/Copy/Paste
+    if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
+        e.preventDefault();
+        copySelection();
+        return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'x') {
+        e.preventDefault();
+        cutSelection();
+        return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+        e.preventDefault();
+        pasteClipboard();
         return;
     }
 
@@ -1483,6 +2051,24 @@ function togglePointInGroup(pointId) {
     updateStatus();
 }
 
+function toggleMoveGroupMode() {
+    isMoveGroupActive = !isMoveGroupActive;
+    moveGroupToggle.classList.toggle('active', isMoveGroupActive);
+    
+    // If activating move group mode, make sure we're in a select mode
+    if (isMoveGroupActive && currentMode !== 'select' && currentMode !== 'selectFace') {
+        setMode('select');
+    }
+    
+    updateStatus();
+}
+
+function setMoveGroupActive(active) {
+    isMoveGroupActive = active;
+    moveGroupToggle.classList.toggle('active', active);
+    updateStatus();
+}
+
 function clearSelection() {
     selectedGroup.forEach(pointId => {
         const element = getPointElement(pointId);
@@ -1491,6 +2077,567 @@ function clearSelection() {
     selectedGroup.clear();
     updateGroupOpsVisibility();
     updateGroupHighlights();
+    updateStatus();
+}
+
+// ============ Rectangle Selection ============
+
+function startRectSelection(e) {
+    const coords = getMouseCoords(e);
+    isRectSelecting = true;
+    rectSelectStart = { x: coords.x, y: coords.y, screenX: e.clientX, screenY: e.clientY };
+    
+    // Determine mode based on modifier keys
+    if (e.altKey && e.shiftKey) {
+        rectSelectMode = 'remove';
+    } else if (e.altKey) {
+        rectSelectMode = 'add';
+    } else {
+        rectSelectMode = 'replace';
+    }
+    
+    // Show selection rectangle (in screen coords, not transformed)
+    const rect = whiteboard.getBoundingClientRect();
+    selectionRectElement.setAttribute('x', e.clientX - rect.left);
+    selectionRectElement.setAttribute('y', e.clientY - rect.top);
+    selectionRectElement.setAttribute('width', 0);
+    selectionRectElement.setAttribute('height', 0);
+    selectionRectElement.style.display = 'block';
+}
+
+function updateRectSelection(e) {
+    if (!isRectSelecting) return;
+    
+    const rect = whiteboard.getBoundingClientRect();
+    const currentX = e.clientX - rect.left;
+    const currentY = e.clientY - rect.top;
+    const startX = rectSelectStart.screenX - rect.left;
+    const startY = rectSelectStart.screenY - rect.top;
+    
+    const x = Math.min(startX, currentX);
+    const y = Math.min(startY, currentY);
+    const width = Math.abs(currentX - startX);
+    const height = Math.abs(currentY - startY);
+    
+    selectionRectElement.setAttribute('x', x);
+    selectionRectElement.setAttribute('y', y);
+    selectionRectElement.setAttribute('width', width);
+    selectionRectElement.setAttribute('height', height);
+}
+
+function endRectSelection(e) {
+    if (!isRectSelecting) return;
+    isRectSelecting = false;
+    selectionRectElement.style.display = 'none';
+    
+    // Calculate selection bounds in world coordinates
+    const endCoords = getMouseCoords(e);
+    const minX = Math.min(rectSelectStart.x, endCoords.x);
+    const maxX = Math.max(rectSelectStart.x, endCoords.x);
+    const minY = Math.min(rectSelectStart.y, endCoords.y);
+    const maxY = Math.max(rectSelectStart.y, endCoords.y);
+    
+    // Find points within the rectangle
+    const pointsInRect = points.filter(p => 
+        p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY
+    );
+    
+    if (rectSelectMode === 'replace') {
+        // Clear existing selection first
+        clearSelection();
+    }
+    
+    pointsInRect.forEach(p => {
+        if (rectSelectMode === 'remove') {
+            if (selectedGroup.has(p.id)) {
+                selectedGroup.delete(p.id);
+                const element = getPointElement(p.id);
+                if (element) element.classList.remove('in-group');
+            }
+        } else {
+            // 'replace' or 'add' mode
+            if (!selectedGroup.has(p.id)) {
+                selectedGroup.add(p.id);
+                const element = getPointElement(p.id);
+                if (element) element.classList.add('in-group');
+            }
+        }
+    });
+    
+    updateGroupOpsVisibility();
+    updateGroupHighlights();
+    updateStatus();
+}
+
+// ============ Line Splitting ============
+
+function getLineAtPoint(x, y, tolerance = 10) {
+    // Find if click is near a line (for splitting)
+    for (const line of lines) {
+        const p1 = points.find(p => p.id === line.from);
+        const p2 = points.find(p => p.id === line.to);
+        if (!p1 || !p2) continue;
+        
+        // Calculate distance from point to line segment
+        const dist = pointToLineDistance(x, y, p1.x, p1.y, p2.x, p2.y);
+        if (dist < tolerance / zoom) {
+            return line;
+        }
+    }
+    return null;
+}
+
+function pointToLineDistance(px, py, x1, y1, x2, y2) {
+    const A = px - x1;
+    const B = py - y1;
+    const C = x2 - x1;
+    const D = y2 - y1;
+    
+    const dot = A * C + B * D;
+    const lenSq = C * C + D * D;
+    let param = -1;
+    
+    if (lenSq !== 0) param = dot / lenSq;
+    
+    let xx, yy;
+    
+    if (param < 0) {
+        xx = x1;
+        yy = y1;
+    } else if (param > 1) {
+        xx = x2;
+        yy = y2;
+    } else {
+        xx = x1 + param * C;
+        yy = y1 + param * D;
+    }
+    
+    const dx = px - xx;
+    const dy = py - yy;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+// Get the closest point on a line segment to a given point
+function getClosestPointOnLine(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lenSq = dx * dx + dy * dy;
+    
+    if (lenSq === 0) return { x: x1, y: y1, t: 0 };
+    
+    let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    
+    return {
+        x: x1 + t * dx,
+        y: y1 + t * dy,
+        t: t
+    };
+}
+
+// Create or update the line split preview (dot on line)
+function showLineSplitPreview(x, y, line) {
+    const p1 = points.find(p => p.id === line.from);
+    const p2 = points.find(p => p.id === line.to);
+    if (!p1 || !p2) return;
+    
+    const closest = getClosestPointOnLine(x, y, p1.x, p1.y, p2.x, p2.y);
+    
+    // Only show preview if we're not too close to the endpoints (within 20-80% of the line)
+    if (closest.t < 0.15 || closest.t > 0.85) {
+        hideLineSplitPreview();
+        return;
+    }
+    
+    if (!lineSplitPreview) {
+        // Create preview elements
+        const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        dot.classList.add('split-preview-dot');
+        dot.setAttribute('r', '6');
+        
+        const line1 = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line1.classList.add('split-preview-line');
+        
+        const line2 = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        line2.classList.add('split-preview-line');
+        
+        // Add to transform group so they scale with zoom
+        transformGroup.appendChild(line1);
+        transformGroup.appendChild(line2);
+        transformGroup.appendChild(dot);
+        
+        lineSplitPreview = { dot, line1, line2, p1, p2 };
+    }
+    
+    // Update positions
+    lineSplitPreview.dot.setAttribute('cx', closest.x);
+    lineSplitPreview.dot.setAttribute('cy', closest.y);
+    lineSplitPreview.p1 = p1;
+    lineSplitPreview.p2 = p2;
+    
+    // Hide preview lines initially (only show when dragging)
+    lineSplitPreview.line1.style.display = 'none';
+    lineSplitPreview.line2.style.display = 'none';
+}
+
+function updateLineSplitPreviewDrag(x, y) {
+    if (!lineSplitPreview) return;
+    
+    const { dot, line1, line2, p1, p2 } = lineSplitPreview;
+    
+    // Update dot position to follow mouse
+    dot.setAttribute('cx', x);
+    dot.setAttribute('cy', y);
+    
+    // Show and update preview lines
+    line1.style.display = '';
+    line2.style.display = '';
+    
+    line1.setAttribute('x1', p1.x);
+    line1.setAttribute('y1', p1.y);
+    line1.setAttribute('x2', x);
+    line1.setAttribute('y2', y);
+    
+    line2.setAttribute('x1', x);
+    line2.setAttribute('y1', y);
+    line2.setAttribute('x2', p2.x);
+    line2.setAttribute('y2', p2.y);
+}
+
+function hideLineSplitPreview() {
+    if (lineSplitPreview) {
+        lineSplitPreview.dot.remove();
+        lineSplitPreview.line1.remove();
+        lineSplitPreview.line2.remove();
+        lineSplitPreview = null;
+    }
+}
+
+function startLineSplit(e, line) {
+    const coords = getMouseCoords(e);
+    isDraggingFromLine = true;
+    splitLineData = {
+        line: { ...line },
+        startX: coords.x,
+        startY: coords.y
+    };
+    
+    // Initialize preview with the line endpoints
+    const p1 = points.find(p => p.id === line.from);
+    const p2 = points.find(p => p.id === line.to);
+    if (p1 && p2 && !lineSplitPreview) {
+        showLineSplitPreview(coords.x, coords.y, line);
+    }
+    if (lineSplitPreview) {
+        lineSplitPreview.p1 = p1;
+        lineSplitPreview.p2 = p2;
+    }
+}
+
+function endLineSplit(e) {
+    if (!isDraggingFromLine || !splitLineData) return;
+    isDraggingFromLine = false;
+    
+    // Clean up preview
+    hideLineSplitPreview();
+    
+    const coords = getMouseCoords(e);
+    const oldLine = splitLineData.line;
+    
+    // Check if we dropped on an existing point
+    const targetEl = document.elementFromPoint(e.clientX, e.clientY);
+    let pointEl = targetEl?.closest('.point');
+    
+    // If no point found, check if we're close to any point (within 15 pixels)
+    let existingPointId = null;
+    if (pointEl) {
+        existingPointId = parseInt(pointEl.dataset.id);
+    } else {
+        const hitRadius = 15 / zoom;
+        for (const p of points) {
+            // Don't connect to the line's own endpoints
+            if (p.id === oldLine.from || p.id === oldLine.to) continue;
+            const dist = Math.sqrt(Math.pow(coords.x - p.x, 2) + Math.pow(coords.y - p.y, 2));
+            if (dist < hitRadius) {
+                existingPointId = p.id;
+                break;
+            }
+        }
+    }
+    
+    // If dropped on an endpoint of the line itself, cancel
+    if (existingPointId === oldLine.from || existingPointId === oldLine.to) {
+        splitLineData = null;
+        updateStatus();
+        return;
+    }
+    
+    let targetPointId;
+    let newPoint = null;
+    
+    if (existingPointId) {
+        // Use existing point
+        targetPointId = existingPointId;
+    } else {
+        // Create new point at current position
+        const newId = ++pointIdCounter;
+        newPoint = { id: newId, x: coords.x, y: coords.y };
+        points.push(newPoint);
+        renderPoint(newPoint);
+        targetPointId = newId;
+    }
+    
+    // Check if lines already exist
+    const line1Exists = lines.some(l => 
+        (l.from === oldLine.from && l.to === targetPointId) ||
+        (l.from === targetPointId && l.to === oldLine.from)
+    );
+    const line2Exists = lines.some(l => 
+        (l.from === targetPointId && l.to === oldLine.to) ||
+        (l.from === oldLine.to && l.to === targetPointId)
+    );
+    
+    const newLines = [];
+    
+    // Create line from first endpoint to target (if doesn't exist)
+    if (!line1Exists) {
+        const line1 = { from: oldLine.from, to: targetPointId };
+        lines.push(line1);
+        renderLine(line1);
+        newLines.push(line1);
+    }
+    
+    // Create line from target to second endpoint (if doesn't exist)
+    if (!line2Exists) {
+        const line2 = { from: targetPointId, to: oldLine.to };
+        lines.push(line2);
+        renderLine(line2);
+        newLines.push(line2);
+    }
+    
+    // Auto-fill the new triangle if a color is selected
+    const activeColor = getActiveColor();
+    let newFill = null;
+    if (activeColor) {
+        // The triangle is formed by oldLine.from, oldLine.to, targetPointId
+        const trianglePoints = [oldLine.from, targetPointId, oldLine.to];
+        // Check if this fill already exists
+        const fillExists = fills.some(f => facesEqual(f.pointIds, trianglePoints));
+        if (!fillExists) {
+            newFill = { pointIds: trianglePoints, color: activeColor };
+            fills.push(newFill);
+            renderFill(newFill);
+        }
+    }
+    
+    // Push undo
+    pushUndo({
+        type: 'splitLine',
+        keepOriginal: true,
+        newPoint: newPoint ? { ...newPoint } : null,
+        existingPointId: existingPointId,
+        newLines: newLines.map(l => ({ ...l })),
+        newFill: newFill ? { ...newFill, pointIds: [...newFill.pointIds] } : null
+    });
+    
+    splitLineData = null;
+    saveState();
+    updateStatus();
+}
+
+function endPointDrag(e) {
+    if (!isDraggingFromPoint || !dragFromPointData) return;
+    isDraggingFromPoint = false;
+    
+    const coords = getMouseCoords(e);
+    const fromPoint = dragFromPointData.fromPoint;
+    const previousSelected = dragFromPointData.previousSelected;
+    
+    // Remove temp line
+    removeTempLine();
+    
+    // Calculate drag distance to determine if this was a click or drag
+    const dragDist = Math.sqrt(
+        Math.pow(coords.x - dragFromPointData.startX, 2) + 
+        Math.pow(coords.y - dragFromPointData.startY, 2)
+    );
+    const wasClick = dragDist < 10; // Less than 10 pixels = click
+    
+    // If this was a click and we had a previous selection, connect them
+    if (wasClick && previousSelected) {
+        const created = createLine(previousSelected.id, fromPoint.id);
+        if (created) {
+            // Keep current point selected for chaining
+            // (it's already selected)
+        }
+        dragFromPointData = null;
+        return;
+    }
+    
+    // Check if we dropped on an existing point
+    const targetEl = document.elementFromPoint(e.clientX, e.clientY);
+    let pointEl = targetEl?.closest('.point');
+    
+    // If no point found, check if we're close to any point (within 15 pixels)
+    if (!pointEl) {
+        const hitRadius = 15 / zoom; // Adjust for zoom
+        for (const p of points) {
+            if (p.id === fromPoint.id) continue;
+            const dist = Math.sqrt(Math.pow(coords.x - p.x, 2) + Math.pow(coords.y - p.y, 2));
+            if (dist < hitRadius) {
+                pointEl = getPointElement(p.id);
+                break;
+            }
+        }
+    }
+    
+    if (pointEl) {
+        // Dropped on an existing point - create line to it
+        const targetId = parseInt(pointEl.dataset.id);
+        if (targetId !== fromPoint.id) {
+            const created = createLine(fromPoint.id, targetId);
+            if (created) {
+                // Select the target point to allow chaining
+                deselectPoint();
+                const targetPoint = points.find(p => p.id === targetId);
+                if (targetPoint) {
+                    selectPoint(targetPoint);
+                }
+            }
+        }
+    } else if (!wasClick) {
+        // Dropped on empty space - create new point and line
+        const newId = ++pointIdCounter;
+        const newPoint = { id: newId, x: coords.x, y: coords.y };
+        points.push(newPoint);
+        renderPoint(newPoint);
+        
+        // Create line from original point to new point
+        const newLine = { from: fromPoint.id, to: newId };
+        
+        // Check for intersections before adding
+        if (!wouldLineIntersect(fromPoint.id, newId)) {
+            lines.push(newLine);
+            renderLine(newLine);
+            
+            pushUndo({
+                type: 'dragCreateLine',
+                newPoint: { ...newPoint },
+                newLine: { ...newLine }
+            });
+            
+            // Select the new point to allow chaining
+            deselectPoint();
+            selectPoint(newPoint);
+            
+            saveState();
+        } else {
+            // Remove the point we just created
+            const idx = points.findIndex(p => p.id === newId);
+            if (idx >= 0) {
+                points.splice(idx, 1);
+                const el = getPointElement(newId);
+                if (el) el.remove();
+            }
+        }
+    }
+    
+    dragFromPointData = null;
+    updateStatus();
+}
+
+function endEmptyDrag(e) {
+    if (!isDraggingFromEmpty || !emptyDragData) return;
+    isDraggingFromEmpty = false;
+    
+    const coords = getMouseCoords(e);
+    const { startX, startY } = emptyDragData;
+    
+    // Remove temp line
+    removeTempLine();
+    
+    // Calculate drag distance
+    const dragDist = Math.sqrt(
+        Math.pow(coords.x - startX, 2) + 
+        Math.pow(coords.y - startY, 2)
+    );
+    
+    // Need minimum drag distance to create a line
+    if (dragDist < 20) {
+        emptyDragData = null;
+        return;
+    }
+    
+    // Create the starting point
+    const startPointId = ++pointIdCounter;
+    const startPoint = { id: startPointId, x: startX, y: startY };
+    points.push(startPoint);
+    renderPoint(startPoint);
+    
+    // Check if we dropped on an existing point
+    const targetEl = document.elementFromPoint(e.clientX, e.clientY);
+    let pointEl = targetEl?.closest('.point');
+    
+    // If no point found, check if we're close to any point (within 15 pixels)
+    if (!pointEl) {
+        const hitRadius = 15 / zoom;
+        for (const p of points) {
+            if (p.id === startPointId) continue;
+            const dist = Math.sqrt(Math.pow(coords.x - p.x, 2) + Math.pow(coords.y - p.y, 2));
+            if (dist < hitRadius) {
+                pointEl = getPointElement(p.id);
+                break;
+            }
+        }
+    }
+    
+    let endPointId;
+    let newEndPoint = null;
+    
+    if (pointEl) {
+        // Dropped on an existing point
+        endPointId = parseInt(pointEl.dataset.id);
+    } else {
+        // Create a new end point
+        endPointId = ++pointIdCounter;
+        newEndPoint = { id: endPointId, x: coords.x, y: coords.y };
+        points.push(newEndPoint);
+        renderPoint(newEndPoint);
+    }
+    
+    // Create the line
+    const newLine = { from: startPointId, to: endPointId };
+    
+    // Check for intersections
+    if (!wouldLineIntersect(startPointId, endPointId)) {
+        lines.push(newLine);
+        renderLine(newLine);
+        
+        pushUndo({
+            type: 'emptyDragLine',
+            startPoint: { ...startPoint },
+            endPoint: newEndPoint ? { ...newEndPoint } : null,
+            endPointId: endPointId,
+            newLine: { ...newLine }
+        });
+        
+        // Select the end point for chaining
+        const endPoint = points.find(p => p.id === endPointId);
+        if (endPoint) {
+            selectPoint(endPoint);
+        }
+        
+        saveState();
+    } else {
+        // Remove the points we created
+        removePointWithoutUndo(startPointId);
+        if (newEndPoint) {
+            removePointWithoutUndo(endPointId);
+        }
+        showTempStatus('Cannot create: line would cross existing line');
+    }
+    
+    emptyDragData = null;
     updateStatus();
 }
 
@@ -2023,6 +3170,366 @@ function importSvgContent(svgText) {
     updateStatus();
 }
 
+// ============ Color Swatches ============
+
+function initSwatches() {
+    // Load swatches from localStorage
+    const saved = localStorage.getItem('whiteboard_swatches');
+    if (saved) {
+        try {
+            swatches = JSON.parse(saved);
+            // Ensure transparent is first
+            if (swatches[0] !== null) {
+                swatches.unshift(null);
+            }
+        } catch (e) {
+            swatches = [null];
+        }
+    }
+    
+    // Ensure we have enough empty slots
+    while (swatches.length < MAX_SWATCHES) {
+        swatches.push(undefined); // undefined = empty slot
+    }
+    
+    renderSwatches();
+}
+
+function saveSwatches() {
+    localStorage.setItem('whiteboard_swatches', JSON.stringify(swatches));
+}
+
+function renderSwatches() {
+    if (!swatchGrid) {
+        console.error('swatchGrid element not found');
+        return;
+    }
+    swatchGrid.innerHTML = '';
+    
+    for (let i = 0; i < MAX_SWATCHES; i++) {
+        const swatch = document.createElement('div');
+        swatch.className = 'swatch';
+        swatch.dataset.index = i;
+        
+        if (i === selectedSwatchIndex) {
+            swatch.classList.add('active');
+        }
+        
+        const swatchValue = swatches[i];
+        const isEmpty = swatchValue === undefined || swatchValue === null;
+        
+        if (i === 0) {
+            // Transparent swatch (index 0 is always transparent)
+            swatch.classList.add('transparent-swatch');
+            swatch.title = 'Transparent (no fill)';
+            swatch.innerHTML = '<svg viewBox="0 0 20 20"><line x1="0" y1="20" x2="20" y2="0" stroke="#e74c3c" stroke-width="2"/></svg>';
+        } else if (isEmpty) {
+            // Empty slot
+            swatch.classList.add('empty');
+            swatch.title = 'Click to save current color';
+        } else {
+            // Color swatch
+            swatch.innerHTML = `<div class="swatch-color" style="background: ${swatchValue}"></div>`;
+            swatch.title = `${swatches[i]} - Right-click to remove`;
+        }
+        
+        swatch.addEventListener('click', () => handleSwatchClick(i));
+        swatch.addEventListener('contextmenu', (e) => handleSwatchRightClick(e, i));
+        
+        swatchGrid.appendChild(swatch);
+    }
+}
+
+function handleSwatchClick(index) {
+    const swatchValue = swatches[index];
+    const isEmpty = swatchValue === undefined || swatchValue === null;
+    
+    if (index === 0) {
+        // Select transparent
+        selectedSwatchIndex = 0;
+        currentColor = null;
+    } else if (isEmpty) {
+        // Empty slot - save current color
+        swatches[index] = colorPicker.value;
+        saveSwatches();
+    } else {
+        // Select this color
+        selectedSwatchIndex = index;
+        currentColor = swatchValue;
+        colorPicker.value = swatchValue;
+    }
+    
+    updateSwatchSelection();
+    renderSwatches();
+}
+
+function handleSwatchRightClick(e, index) {
+    e.preventDefault();
+    
+    if (index === 0) return; // Can't remove transparent
+    
+    const swatchValue = swatches[index];
+    const isEmpty = swatchValue === undefined || swatchValue === null;
+    if (isEmpty) return; // Already empty
+    
+    // Remove swatch
+    swatches[index] = null;
+    saveSwatches();
+    
+    if (selectedSwatchIndex === index) {
+        selectedSwatchIndex = -1;
+    }
+    
+    renderSwatches();
+}
+
+function updateSwatchSelection() {
+    const allSwatches = swatchGrid.querySelectorAll('.swatch');
+    allSwatches.forEach((swatch, i) => {
+        swatch.classList.toggle('active', i === selectedSwatchIndex);
+    });
+}
+
+function getActiveColor() {
+    if (selectedSwatchIndex === 0) {
+        return null; // Transparent
+    }
+    return currentColor;
+}
+
+// ============ Background Image ============
+
+function handleBackgroundLoad(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = function(event) {
+        const img = new Image();
+        img.onload = function() {
+            bgImageData = {
+                src: event.target.result,
+                naturalWidth: img.naturalWidth,
+                naturalHeight: img.naturalHeight,
+                scale: 100,
+                x: 0,
+                y: 0
+            };
+            updateBackgroundImage();
+            bgScaleSlider.value = 100;
+            bgScaleDisplay.textContent = '100%';
+        };
+        img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
+}
+
+function updateBackgroundImage() {
+    if (!bgImageData) {
+        backgroundImage.style.display = 'none';
+        return;
+    }
+    
+    const scale = bgImageData.scale / 100;
+    const width = bgImageData.naturalWidth * scale;
+    const height = bgImageData.naturalHeight * scale;
+    
+    backgroundImage.setAttribute('href', bgImageData.src);
+    backgroundImage.setAttribute('x', bgImageData.x);
+    backgroundImage.setAttribute('y', bgImageData.y);
+    backgroundImage.setAttribute('width', width);
+    backgroundImage.setAttribute('height', height);
+    backgroundImage.style.display = 'block';
+}
+
+function handleBackgroundScale(e) {
+    if (!bgImageData) return;
+    bgImageData.scale = parseInt(e.target.value);
+    bgScaleDisplay.textContent = `${bgImageData.scale}%`;
+    updateBackgroundImage();
+}
+
+function clearBackground() {
+    bgImageData = null;
+    backgroundImage.style.display = 'none';
+    backgroundImage.removeAttribute('href');
+    bgScaleSlider.value = 100;
+    bgScaleDisplay.textContent = '100%';
+}
+
+// ============ Clipboard (Cut/Copy/Paste) ============
+
+function copySelection() {
+    if (selectedGroup.size === 0) return;
+    
+    // Calculate center of selection for relative positioning
+    const bounds = getGroupBounds();
+    if (!bounds) return;
+    
+    const copiedPoints = [];
+    const copiedLines = [];
+    
+    // Copy points with relative positions
+    selectedGroup.forEach(pointId => {
+        const point = points.find(p => p.id === pointId);
+        if (point) {
+            copiedPoints.push({
+                originalId: point.id,
+                relX: point.x - bounds.centerX,
+                relY: point.y - bounds.centerY
+            });
+        }
+    });
+    
+    // Copy lines between selected points
+    lines.forEach(line => {
+        if (selectedGroup.has(line.from) && selectedGroup.has(line.to)) {
+            copiedLines.push({
+                fromOriginalId: line.from,
+                toOriginalId: line.to
+            });
+        }
+    });
+    
+    // Copy fills where all points are in the selection
+    const copiedFills = [];
+    fills.forEach(fill => {
+        const allPointsSelected = fill.pointIds.every(id => selectedGroup.has(id));
+        if (allPointsSelected) {
+            copiedFills.push({
+                originalPointIds: [...fill.pointIds],
+                color: fill.color
+            });
+        }
+    });
+    
+    clipboard = { points: copiedPoints, lines: copiedLines, fills: copiedFills };
+}
+
+function cutSelection() {
+    copySelection();
+    if (clipboard && clipboard.points.length > 0) {
+        deleteGroup();
+    }
+}
+
+function pasteClipboard() {
+    if (!clipboard || clipboard.points.length === 0) return;
+    
+    // Paste at center of viewport
+    const rect = whiteboard.getBoundingClientRect();
+    const centerX = (rect.width / 2 - panX) / zoom;
+    const centerY = (rect.height / 2 - panY) / zoom;
+    
+    const idMap = new Map(); // Map original IDs to new IDs
+    const newPoints = [];
+    const newLines = [];
+    const newFills = [];
+    
+    // Create new points
+    clipboard.points.forEach(cp => {
+        const newId = ++pointIdCounter;
+        idMap.set(cp.originalId, newId);
+        const newPoint = {
+            id: newId,
+            x: centerX + cp.relX,
+            y: centerY + cp.relY
+        };
+        newPoints.push(newPoint);
+        points.push(newPoint);
+        renderPoint(newPoint);
+    });
+    
+    // Create new lines
+    clipboard.lines.forEach(cl => {
+        const newLine = {
+            from: idMap.get(cl.fromOriginalId),
+            to: idMap.get(cl.toOriginalId)
+        };
+        if (newLine.from && newLine.to) {
+            newLines.push(newLine);
+            lines.push(newLine);
+            renderLine(newLine);
+        }
+    });
+    
+    // Create new fills
+    if (clipboard.fills) {
+        clipboard.fills.forEach(cf => {
+            const newPointIds = cf.originalPointIds.map(id => idMap.get(id)).filter(id => id);
+            if (newPointIds.length === cf.originalPointIds.length) {
+                const newFill = {
+                    pointIds: newPointIds,
+                    color: cf.color
+                };
+                newFills.push(newFill);
+                fills.push(newFill);
+                renderFill(newFill);
+            }
+        });
+    }
+    
+    // Push undo
+    pushUndo({
+        type: 'paste',
+        newPoints: newPoints.map(p => ({ ...p })),
+        newLines: newLines.map(l => ({ ...l })),
+        newFills: newFills.map(f => ({ ...f, pointIds: [...f.pointIds] }))
+    });
+    
+    // Select the pasted points and activate move group mode
+    clearSelection();
+    newPoints.forEach(p => {
+        selectedGroup.add(p.id);
+        const element = getPointElement(p.id);
+        if (element) element.classList.add('in-group');
+    });
+    updateGroupOpsVisibility();
+    updateGroupHighlights();
+    
+    // Switch to select mode and activate move group toggle for positioning
+    if (currentMode !== 'select' && currentMode !== 'selectFace') {
+        setMode('select');
+    }
+    setMoveGroupActive(true);
+    
+    saveState();
+    updateStatus();
+}
+
+// ============ Select Face Mode ============
+
+function selectFaceAtPoint(x, y, mode = 'replace') {
+    const face = findFaceAtPoint(x, y);
+    if (!face || face.length === 0) return;
+    
+    if (mode === 'replace') {
+        clearSelection();
+    }
+    
+    face.forEach(pointId => {
+        if (mode === 'remove') {
+            if (selectedGroup.has(pointId)) {
+                selectedGroup.delete(pointId);
+                const element = getPointElement(pointId);
+                if (element) element.classList.remove('in-group');
+            }
+        } else {
+            // 'replace' or 'add'
+            if (!selectedGroup.has(pointId)) {
+                selectedGroup.add(pointId);
+                const element = getPointElement(pointId);
+                if (element) element.classList.add('in-group');
+            }
+        }
+    });
+    
+    updateGroupOpsVisibility();
+    updateGroupHighlights();
+    updateStatus();
+}
+
 // ============ Zoom and Pan ============
 
 function updateTransform() {
@@ -2125,8 +3632,8 @@ function updateStatus() {
             break;
         case 'connect':
             text = selectedPoint 
-                ? 'Click another point to connect (chains automatically), or click elsewhere to cancel'
-                : 'Click a point to start connecting';
+                ? 'Click another point to connect, or drag to empty space for new point'
+                : 'Drag from point/line/empty space to create connections';
             break;
         case 'delete':
             text = 'Click a point or line to delete it';
@@ -2135,9 +3642,18 @@ function updateStatus() {
             text = 'Click inside a bounded region to fill it';
             break;
         case 'select':
+            if (isMoveGroupActive && selectedGroup.size > 0) {
+                text = `Move mode: drag selection (${selectedGroup.size} points) to reposition`;
+            } else if (selectedGroup.size > 0) {
+                text = `${selectedGroup.size} point${selectedGroup.size !== 1 ? 's' : ''} selected - Ctrl+click to toggle, drag to select area`;
+            } else {
+                text = 'Drag to select area, Ctrl+click to toggle, Alt+drag to add, Alt+Shift+drag to remove';
+            }
+            break;
+        case 'selectFace':
             text = selectedGroup.size > 0
-                ? `${selectedGroup.size} point${selectedGroup.size !== 1 ? 's' : ''} selected - use group tools or click points to add/remove`
-                : 'Click points to add them to selection';
+                ? `${selectedGroup.size} point${selectedGroup.size !== 1 ? 's' : ''} selected - click face to select, Ctrl/Alt to add, Alt+Shift to remove`
+                : 'Click inside a triangle to select its points';
             break;
     }
     
